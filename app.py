@@ -289,10 +289,11 @@ def get_gemini_recommendation(
     enemy_names: list[str],
     ban_names: list[str],
     api_key: str,
+    patch_version: str,
 ) -> str:
     """Call Gemini and return the recommendation text."""
     client = genai.Client(api_key=api_key)
-    prompt = build_prompt(role, ally_names, enemy_names, ban_names)
+    prompt = build_prompt(role, ally_names, enemy_names, ban_names, patch_version)
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
@@ -609,7 +610,8 @@ def main() -> None:
         with st.spinner("🤖 Gemini is analyzing the draft…"):
             try:
                 recommendation = get_gemini_recommendation(
-                    role, ally_names, enemy_names, ban_names, api_key
+                    role, ally_names, enemy_names, ban_names, api_key,
+                    patch_version=_latest_ddragon_version(),
                 )
                 st.session_state["last_sig"] = sig
                 st.session_state["last_reco"] = recommendation
