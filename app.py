@@ -146,18 +146,84 @@ def _completed_actions(
     return ids
 
 
+def _is_local_player_picking(session: dict[str, Any]) -> bool:
+    """Return True when the local player has an active (uncompleted) pick action."""
+    local_cell = session.get("localPlayerCellId", -1)
+    for group in session.get("actions", []):
+        for action in group:
+            if (
+                action.get("actorCellId") == local_cell
+                and action.get("type") == "pick"
+                and action.get("isInProgress", False)
+            ):
+                return True
+    return False
+
+
+def _local_player_locked_champion(
+    session: dict[str, Any],
+) -> int | None:
+    """Return the champion ID the local player locked in, or ``None``."""
+    local_cell = session.get("localPlayerCellId", -1)
+    for group in session.get("actions", []):
+        for action in group:
+            if (
+                action.get("actorCellId") == local_cell
+                and action.get("type") == "pick"
+                and action.get("completed", False)
+            ):
+                cid = action.get("championId", 0)
+                if cid != 0:
+                    return cid
+    return None
+
+
+def _is_my_pick_next(session: dict[str, Any]) -> bool:
+    """Return True when the action group immediately before the player's pick is in progress.
+
+    This lets us pre-generate the recommendation so it's cached and
+    displayed instantly when the player's turn actually starts.
+    """
+    local_cell = session.get("localPlayerCellId", -1)
+    actions = session.get("actions", [])
+
+    # Find the group index containing the player's first uncompleted pick.
+    my_pick_group_idx: int | None = None
+    for group_idx, group in enumerate(actions):
+        for action in group:
+            if (
+                action.get("actorCellId") == local_cell
+                and action.get("type") == "pick"
+                and not action.get("completed", False)
+            ):
+                my_pick_group_idx = group_idx
+                break
+        if my_pick_group_idx is not None:
+            break
+
+    if my_pick_group_idx is None or my_pick_group_idx == 0:
+        return False
+
+    # Check if the immediately preceding group has an in-progress action.
+    prev_group = actions[my_pick_group_idx - 1]
+    return any(action.get("isInProgress", False) for action in prev_group)
+
+
 def extract_draft_state(
     session: dict[str, Any],
 ) -> dict[str, Any]:
     """Derive a simplified draft state from the raw session JSON.
 
     Returns a dict with keys:
-      - ``blue_picks``:  live hover/selection IDs for UI display
-      - ``red_picks``:   live hover/selection IDs for UI display
-      - ``locked_blue``: only locked-in (completed) ally picks
-      - ``locked_red``:  only locked-in (completed) enemy picks
-      - ``bans``:        completed bans
-      - ``local_team``:  ``"blue"`` or ``"red"``
+      - ``blue_picks``:    live hover/selection IDs for UI display
+      - ``red_picks``:     live hover/selection IDs for UI display
+      - ``locked_blue``:   only locked-in (completed) ally picks
+      - ``locked_red``:    only locked-in (completed) enemy picks
+      - ``bans``:          completed bans
+      - ``local_team``:    ``"blue"`` or ``"red"``
+      - ``is_my_pick_turn``: ``True`` when the local player is actively picking
+      - ``is_my_pick_next``: ``True`` when the turn before the player's pick is active
+      - ``my_champion``:  locked champion ID (int) or ``None``
     """
     my_team: list[dict] = session.get("myTeam", [])
     their_team: list[dict] = session.get("theirTeam", [])
@@ -181,6 +247,9 @@ def extract_draft_state(
         "locked_red": locked_red,
         "bans": bans,
         "local_team": local_team,
+        "is_my_pick_turn": _is_local_player_picking(session),
+        "is_my_pick_next": _is_my_pick_next(session),
+        "my_champion": _local_player_locked_champion(session),
     }
 
 
@@ -294,6 +363,77 @@ def get_gemini_recommendation(
     """Call Gemini and return the recommendation text."""
     client = genai.Client(api_key=api_key)
     prompt = build_prompt(role, ally_names, enemy_names, ban_names, patch_version)
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+    )
+    return response.text or "_No response received._"
+
+
+def build_post_pick_prompt(
+    champion: str,
+    role: str,
+    ally_picks: list[str],
+    enemy_picks: list[str],
+    patch_version: str,
+) -> str:
+    """Construct a prompt that analyses the player's locked champion strengths."""
+    allies = ", ".join(ally_picks) if ally_picks else "None yet"
+    enemies = ", ".join(enemy_picks) if enemy_picks else "None yet"
+
+    return (
+        "You are an elite, high-ELO League of Legends analyst and in-game "
+        "coach. The player has just locked in their champion. Your job is to "
+        "provide a comprehensive strengths and game-plan briefing so they "
+        "know exactly how to win with their pick.\n\n"
+        f"### CURRENT PATCH: {patch_version}\n"
+        "All advice MUST reflect the latest balance changes, item reworks, "
+        "rune adjustments, and meta shifts on this patch.\n\n"
+        "### LOCKED PICK:\n"
+        f"- Champion: **{champion}**\n"
+        f"- Role: {role}\n"
+        f"- Ally Team: {allies}\n"
+        f"- Enemy Team: {enemies}\n\n"
+        "### ANALYSIS:\n"
+        "Provide your response in clean, highly readable Markdown. "
+        "Go straight into the analysis using this template:\n\n"
+        f"## 🛡️ Game Plan: **{champion}**\n\n"
+        "### 💪 Your Strong Sides\n"
+        "List 3-5 key strengths of this champion in this specific matchup "
+        "and team composition. Reference abilities, stats, and kit "
+        "interactions that give you an edge.\n\n"
+        "### ⚡ Power Spikes\n"
+        "* **Early (Lv 1-6):** [Describe your early game win condition — "
+        "when to trade, all-in, or farm safely].\n"
+        "* **Mid (1-2 items):** [Describe what changes when you hit your "
+        "first major item spike and how to leverage it].\n"
+        "* **Late (3+ items):** [Describe your late-game role and how "
+        "strong you scale relative to the enemy].\n\n"
+        "### 🎯 Matchup Tips vs Enemy Team\n"
+        "For **each** revealed enemy champion, provide a bullet with "
+        "actionable advice:\n"
+        "* **[Enemy Champion]:** [How to play against them — abilities "
+        "to dodge, when you win trades, and what to avoid].\n\n"
+        "### 🗺️ Win Condition\n"
+        "Summarize in 2-3 sentences exactly how this team wins the game "
+        "with your champion. Focus on macro objectives, teamfight role, "
+        "and split-push vs. group decision.\n"
+    )
+
+
+def get_gemini_post_pick(
+    champion: str,
+    role: str,
+    ally_names: list[str],
+    enemy_names: list[str],
+    api_key: str,
+    patch_version: str,
+) -> str:
+    """Call Gemini with the post-pick strengths prompt."""
+    client = genai.Client(api_key=api_key)
+    prompt = build_post_pick_prompt(
+        champion, role, ally_names, enemy_names, patch_version
+    )
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
@@ -473,6 +613,26 @@ section[data-testid="stSidebar"] {
     font-size: 15px;
 }
 .status-banner .icon { font-size: 48px; margin-bottom: 12px; }
+
+/* YOUR TURN banner */
+@keyframes turn-glow {
+    0%   { box-shadow: 0 0 8px rgba(200, 155, 60, 0.3); }
+    50%  { box-shadow: 0 0 20px rgba(200, 155, 60, 0.6); }
+    100% { box-shadow: 0 0 8px rgba(200, 155, 60, 0.3); }
+}
+.your-turn-banner {
+    text-align: center;
+    padding: 14px 20px;
+    margin: 8px 0 12px 0;
+    background: linear-gradient(135deg, #1a1203 0%, #2a1f08 50%, #1a1203 100%);
+    border: 1px solid #C89B3C;
+    border-radius: 10px;
+    color: #F0E6D2;
+    font-weight: 700;
+    font-size: 16px;
+    letter-spacing: 1px;
+    animation: turn-glow 2s ease-in-out infinite;
+}
 </style>
 """
 
@@ -545,8 +705,9 @@ def main() -> None:
             "</div>",
             unsafe_allow_html=True,
         )
-        # Reset stored signature so a fresh recommendation fires next time.
-        st.session_state.pop("last_sig", None)
+        # Reset stored state so fresh recommendations fire next time.
+        for _key in ("last_sig", "last_reco", "pick_reco", "post_pick_reco"):
+            st.session_state.pop(_key, None)
         time.sleep(POLL_INTERVAL_SECONDS)
         st.rerun()
         return
@@ -583,59 +744,121 @@ def main() -> None:
 
     st.markdown("---")
 
-    # ── Gemini recommendation ────────────────────────────────────────────
-    sig = draft_signature(draft)
-    prev_sig = st.session_state.get("last_sig")
+    # ── Turn / phase detection ────────────────────────────────────────────
+    is_my_turn = draft["is_my_pick_turn"]
+    my_champion_id = draft["my_champion"]
+    my_champion_name = (
+        champ_map.get(my_champion_id, "Unknown") if my_champion_id else None
+    )
+
+    # Shared name lists used by both prompts.
+    ally_names = [
+        champ_map.get(cid, "Unknown")
+        for cid in draft["locked_blue"]
+        if cid != 0
+    ]
+    enemy_names = [
+        champ_map.get(cid, "Unknown")
+        for cid in draft["locked_red"]
+        if cid != 0
+    ]
+    ban_names = [
+        champ_map.get(cid, "Unknown")
+        for cid in draft["bans"]
+        if cid != 0
+    ]
 
     if not api_key:
         st.warning("Enter your Gemini API key in the sidebar to receive recommendations.")
-    elif sig != prev_sig:
-        # A pick was locked in or a ban completed — query Gemini.
-        ally_names = [
-            champ_map.get(cid, "Unknown")
-            for cid in draft["locked_blue"]
-            if cid != 0
-        ]
-        enemy_names = [
-            champ_map.get(cid, "Unknown")
-            for cid in draft["locked_red"]
-            if cid != 0
-        ]
-        ban_names = [
-            champ_map.get(cid, "Unknown")
-            for cid in draft["bans"]
-            if cid != 0
-        ]
 
-        with st.spinner("🤖 Gemini is analyzing the draft…"):
-            try:
-                recommendation = get_gemini_recommendation(
-                    role, ally_names, enemy_names, ban_names, api_key,
-                    patch_version=_latest_ddragon_version(),
-                )
-                st.session_state["last_sig"] = sig
-                st.session_state["last_reco"] = recommendation
-            except Exception as exc:
-                st.error(f"Gemini API error: {exc}")
-                recommendation = None
+    # ── PHASE 2: Player has locked in → strengths analysis ────────────────
+    elif my_champion_name:
+        # Show locked-in banner.
+        icon = _champion_icon_url(my_champion_name)
+        st.markdown(
+            f"<div class='your-turn-banner' style='border-color:#0397AB;'>"
+            f"<img src='{icon}' width='32' "
+            f"style='vertical-align:middle;border-radius:6px;margin-right:8px;'>"
+            f"LOCKED IN — {my_champion_name}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
-        if recommendation:
-            st.markdown("### 🤖 AI Recommendation")
+        # Generate post-pick analysis exactly once per game.
+        if "post_pick_reco" not in st.session_state:
+            with st.spinner("🤖 Gemini is analyzing your strengths…"):
+                try:
+                    analysis = get_gemini_post_pick(
+                        my_champion_name, role,
+                        ally_names, enemy_names, api_key,
+                        patch_version=_latest_ddragon_version(),
+                    )
+                    st.session_state["post_pick_reco"] = analysis
+                except Exception as exc:
+                    st.error(f"Gemini API error: {exc}")
+
+        cached_post = st.session_state.get("post_pick_reco")
+        if cached_post:
+            st.markdown("### 💪 Your Champion Strengths")
             st.markdown(
-                f"<div class='reco-card'>{_md_to_html_safe(recommendation)}</div>",
+                f"<div class='reco-card'>{_md_to_html_safe(cached_post)}</div>",
                 unsafe_allow_html=True,
             )
-    else:
-        # Draft unchanged — show cached recommendation.
-        cached = st.session_state.get("last_reco")
-        if cached:
+
+    # ── PHASE 1: It's our pick turn → champion recommendation (once) ─────
+    elif is_my_turn:
+        st.markdown(
+            "<div class='your-turn-banner'>🎯 YOUR TURN — Pick a champion!</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Generate pick recommendation exactly once per pick turn.
+        if "pick_reco" not in st.session_state:
+            with st.spinner("🤖 Gemini is analyzing the draft…"):
+                try:
+                    recommendation = get_gemini_recommendation(
+                        role, ally_names, enemy_names, ban_names, api_key,
+                        patch_version=_latest_ddragon_version(),
+                    )
+                    st.session_state["pick_reco"] = recommendation
+                except Exception as exc:
+                    st.error(f"Gemini API error: {exc}")
+
+        cached_pick = st.session_state.get("pick_reco")
+        if cached_pick:
             st.markdown("### 🤖 AI Recommendation")
             st.markdown(
-                f"<div class='reco-card'>{_md_to_html_safe(cached)}</div>",
+                f"<div class='reco-card'>{_md_to_html_safe(cached_pick)}</div>",
+                unsafe_allow_html=True,
+            )
+
+    # ── Waiting phase (bans / enemy turns) ────────────────────────────────
+    else:
+        # Pre-generate recommendation when the turn before ours is active.
+        if (
+            api_key
+            and draft["is_my_pick_next"]
+            and "pick_reco" not in st.session_state
+        ):
+            with st.spinner("🤖 Pre-loading recommendation for your turn…"):
+                try:
+                    recommendation = get_gemini_recommendation(
+                        role, ally_names, enemy_names, ban_names, api_key,
+                        patch_version=_latest_ddragon_version(),
+                    )
+                    st.session_state["pick_reco"] = recommendation
+                except Exception as exc:
+                    st.error(f"Gemini API error: {exc}")
+
+        cached_pick = st.session_state.get("pick_reco")
+        if cached_pick:
+            st.markdown("### 🤖 AI Recommendation")
+            st.markdown(
+                f"<div class='reco-card'>{_md_to_html_safe(cached_pick)}</div>",
                 unsafe_allow_html=True,
             )
         else:
-            st.info("Waiting for draft changes to generate a recommendation…")
+            st.info("⏳ Waiting for your pick turn…")
 
     # ── Auto-refresh ─────────────────────────────────────────────────────
     time.sleep(POLL_INTERVAL_SECONDS)
